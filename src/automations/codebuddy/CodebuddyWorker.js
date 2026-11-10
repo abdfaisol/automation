@@ -15,9 +15,10 @@ const {
 const QUEUE_RETRY_DELAY_MS = 500;
 
 class CodebuddyWorker extends BaseWorker {
-    constructor(workerAccounts, workerId, browserArgsIndex, workerIndex, total, progress, log, useProxy = true) {
+    constructor(workerAccounts, workerId, browserArgsIndex, workerIndex, total, progress, log, useProxy = true, authMode = "github") {
         super(workerAccounts, workerId, browserArgsIndex, workerIndex, total, progress, log);
         this.useProxy = useProxy;
+        this.authMode = authMode;
     }
 
     getAutomationName() {
@@ -32,14 +33,23 @@ class CodebuddyWorker extends BaseWorker {
             this.log,
             this.updateProgress.bind(this),
             this.useProxy,
+            this.authMode,
         );
     }
 
     readAccounts() {
+        if (this.authMode === "google") {
+            const { readAccounts } = require("../../utils");
+            return readAccounts();
+        }
         return readCodebuddyAccounts();
     }
 
     removeAccount(account) {
+        if (this.authMode === "google") {
+            removeAccount(account.rawLine);
+            return;
+        }
         removeCodebuddyAccount(account);
     }
 

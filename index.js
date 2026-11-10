@@ -305,8 +305,8 @@ async function runSelectedAutomations(
                     codebuddyOptions.tempEmailProvider,
                 );
             }
-            // Existing mode: use github_keys.txt
-            return automationMap[type].fn(sharedProgress, proxySettings[type]);
+            // Existing mode: use github_keys.txt or accounts.txt (Google)
+            return automationMap[type].fn(sharedProgress, proxySettings[type], codebuddyOptions || {});
         }
         if (type === 'tokengo') {
             return automationMap[type].fn(sharedProgress, proxySettings[type], tokengoOptions || {});
@@ -550,7 +550,13 @@ async function main() {
 
                     if (selected.includes("codebuddy")) {
                         const existingCount = countGithubKeys();
+                        const googleAccounts = readAccounts();
                         const choices = [
+                            {
+                                name: `Google Account Login (accounts.txt - ${googleAccounts.length} account${googleAccounts.length === 1 ? "" : "s"})`,
+                                value: "google",
+                                disabled: googleAccounts.length === 0 ? "accounts.txt empty / not found" : false,
+                            },
                             {
                                 name: `Use existing github_keys.txt (${existingCount} account${existingCount === 1 ? "" : "s"})`,
                                 value: "existing",
@@ -566,13 +572,18 @@ async function main() {
                             {
                                 type: "list",
                                 name: "codebuddyMode",
-                                message: "Codebuddy account source:",
+                                message: "Codebuddy login method / account source:",
                                 choices,
-                                default: existingCount > 0 ? "existing" : "create",
+                                default: googleAccounts.length > 0 ? "google" : (existingCount > 0 ? "existing" : "create"),
                             },
                         ]);
 
-                        if (codebuddyMode === "create") {
+                        if (codebuddyMode === "google") {
+                            codebuddyOptions = {
+                                mode: "existing",
+                                authMode: "google",
+                            };
+                        } else if (codebuddyMode === "create") {
                             const { createCount } = await inquirer.prompt([
                                 {
                                     type: "input",

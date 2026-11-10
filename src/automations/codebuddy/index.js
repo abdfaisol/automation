@@ -21,6 +21,7 @@ const { STEPS, createProgressManager } = require("../../cli/progress");
 const { printReport } = require("../../cli/reporter");
 const { waitForGitHubDeviceOTP } = require("../../providers/email");
 const { createRouter } = require("../../providers/router");
+const { completeGoogleLogin } = require("../../providers/google/login");
 
 const QUEUE_RETRY_DELAY_MS = 500;
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -415,6 +416,132 @@ async function waitForGitHubPage(browser, currentPage, log, timeout = 45000) {
     }
 
     throw new Error("GitHub page not opened after Codebuddy GitHub/Confirm click");
+}
+
+async function waitForGooglePage(browser, currentPage, log, timeout = 45000) {
+    const start = Date.now();
+
+    while (Date.now() - start < timeout) {
+        const pages = await browser.pages();
+
+        for (let i = pages.length - 1; i >= 0; i--) {
+            const p = pages[i];
+            try {
+                const url = p.url();
+                if (url.includes("accounts.google.com") || url.includes("google.com")) {
+                    if (p !== currentPage) {
+                        log(`Switched to Google page/popup: ${url}`);
+                    } else {
+                        log(`Google opened in same tab: ${url}`);
+                    }
+                    return p;
+                }
+            } catch (_) {}
+        }
+
+        try {
+            const url = currentPage.url();
+            if (url.includes("accounts.google.com") || url.includes("google.com")) {
+                log(`Google URL on current page: ${url}`);
+                return currentPage;
+            }
+        } catch (_) {}
+
+        await sleep(500);
+    }
+
+    throw new Error("Google page not opened after Codebuddy Google/Confirm click");
+}
+
+async function handleCodebuddyGoogleButton(page, log) {
+    const config = getConfig();
+    const browser = page.browser();
+
+    log("Waiting for Codebuddy login page...");
+    await page.waitForFunction(() => window.location.href.includes("codebuddy.ai/login"), {
+        timeout: config.timeouts.navigation,
+    });
+    log(`Login page loaded: ${page.url()}`);
+
+    try {
+        await page.waitForNetworkIdle({ timeout: 10000 });
+        log("Network idle");
+    } catch (_) {
+        log("Network idle timeout, continuing...");
+    }
+
+    try {
+        await page.waitForFunction(
+            () => {
+                const loading = document.querySelector(".auth-loading");
+                return !loading || loading.style.display === "none" || !loading.offsetParent;
+            },
+            { timeout: 10000 },
+        );
+        log("Loading overlay gone");
+    } catch (_) {
+        log("Loading overlay still present, continuing...");
+    }
+
+    log("Waiting 4s for iframe interactive...");
+    await sleep(4000);
+
+    // iframe prep: Sign up tab + ToS
+    await prepareAuthIframe(page, log);
+
+    // Click Google SSO button in iframe
+    log("Searching Sign up/login with Google button...");
+    const googleSelectors = [
+        "a#social-google",
+        'a[href*="google/login"]',
+        'a[href*="broker/google"]',
+        'a.sp-button[href*="google"]',
+        'a[href*="google"]',
+    ];
+
+    let googleClicked = false;
+    try {
+        const result = await clickInFrames(page, googleSelectors, 15000, 2000, log);
+        log(`Clicked Google button in frame '${result.frameName}' (${result.selector})`);
+        googleClicked = true;
+    } catch (err) {
+        // text fallback
+        for (const frame of page.frames()) {
+            try {
+                const ok = await frame.evaluate(() => {
+                    const els = Array.from(document.querySelectorAll("a, button"));
+                    const el = els.find((e) => {
+                        const t = (e.textContent || "").toLowerCase();
+                        const h = e.getAttribute("href") || "";
+                        return h.includes("google") || t.includes("google");
+                    });
+                    if (el) {
+                        el.click();
+                        return true;
+                    }
+                    return false;
+                });
+                if (ok) {
+                    log(`Clicked Google via text in frame '${frame.name() || "unnamed"}'`);
+                    googleClicked = true;
+                    break;
+                }
+            } catch (_) {}
+        }
+    }
+
+    if (!googleClicked) {
+        throw new Error("Google signup button not found in any iframe");
+    }
+
+    // Confirm dialog in iframe after Google click
+    await sleep(2000);
+    await handleConfirmButton(page, log);
+
+    // Wait for Google login page (same tab or popup)
+    log("Waiting for Google page after Confirm...");
+    const googlePage = await waitForGooglePage(browser, page, log, 45000);
+    return googlePage;
 }
 
 async function handleCodebuddyGitHubButton(page, log) {
@@ -912,6 +1039,7 @@ async function processCodebuddyAccount(
     log,
     updateProgress,
     useProxy = true,
+    authMode = "github",
 ) {
     const config = getConfig();
     let poolProxy = null;
@@ -928,7 +1056,7 @@ async function processCodebuddyAccount(
     const deviceCodeData = await getCodebuddyDeviceCode(log);
     const { device_code, verification_uri, codeVerifier, _router: router } = deviceCodeData;
 
-    log(`Launching browser for ${account.email}`);
+    log(`Launching browser for ${account.email} (Auth: ${authMode})`);
     const { browser, page, proxy: conditionalProxy } = await launchBrowser(
         browserArgsIndex,
         workerIndex,
@@ -972,45 +1100,70 @@ async function processCodebuddyAccount(
             timeout: config.timeouts.navigation,
         });
 
-        // 2) iframe: Sign up tab + ToS + GitHub button + Confirm
-        updateProgress({ step: STEPS.NAVIGATING, email: "Codebuddy GitHub button..." });
-        let activePage = await handleCodebuddyGitHubButton(page, log);
+        let activePage;
+        if (authMode === "google") {
+            // 2) iframe: Sign up tab + ToS + Google button + Confirm
+            updateProgress({ step: STEPS.NAVIGATING, email: "Codebuddy Google button..." });
+            activePage = await handleCodebuddyGoogleButton(page, log);
 
-        // 3) GitHub login (email/password + device OTP if needed)
-        updateProgress({ step: STEPS.WAITING, email: "GitHub login..." });
-        await handleGitHubLogin(activePage, account, log);
+            // 3) Google login
+            updateProgress({ step: STEPS.WAITING, email: "Google login..." });
+            log("Completing Google login...");
+            await completeGoogleLogin(activePage, account, log);
 
-        // After login, page might navigate; re-resolve active github/codebuddy page
-        try {
-            const pages = await browser.pages();
-            const gh = [...pages].reverse().find((p) => {
-                try {
-                    const u = p.url();
-                    return u.includes("github.com") || u.includes("codebuddy.ai");
-                } catch (_) {
-                    return false;
-                }
-            });
-            if (gh) activePage = gh;
-        } catch (_) {}
+            // Wait for redirect back to Codebuddy
+            try {
+                const pages = await browser.pages();
+                const cb = [...pages].reverse().find((p) => {
+                    try {
+                        return p.url().includes("codebuddy.ai");
+                    } catch (_) {
+                        return false;
+                    }
+                });
+                if (cb) activePage = cb;
+            } catch (_) {}
+        } else {
+            // 2) iframe: Sign up tab + ToS + GitHub button + Confirm
+            updateProgress({ step: STEPS.NAVIGATING, email: "Codebuddy GitHub button..." });
+            activePage = await handleCodebuddyGitHubButton(page, log);
 
-        // 4) GitHub authorize app
-        updateProgress({ step: STEPS.WAITING, email: "GitHub authorize..." });
-        await handleGitHubAuthorize(activePage, log);
+            // 3) GitHub login (email/password + device OTP if needed)
+            updateProgress({ step: STEPS.WAITING, email: "GitHub login..." });
+            await handleGitHubLogin(activePage, account, log);
 
-        // Re-resolve page after authorize redirect
-        try {
-            const pages = await browser.pages();
-            const cb = [...pages].reverse().find((p) => {
-                try {
-                    return p.url().includes("codebuddy.ai");
-                } catch (_) {
-                    return false;
-                }
-            });
-            if (cb) activePage = cb;
-            else if (pages.length) activePage = pages[pages.length - 1];
-        } catch (_) {}
+            // After login, page might navigate; re-resolve active github/codebuddy page
+            try {
+                const pages = await browser.pages();
+                const gh = [...pages].reverse().find((p) => {
+                    try {
+                        const u = p.url();
+                        return u.includes("github.com") || u.includes("codebuddy.ai");
+                    } catch (_) {
+                        return false;
+                    }
+                });
+                if (gh) activePage = gh;
+            } catch (_) {}
+
+            // 4) GitHub authorize app
+            updateProgress({ step: STEPS.WAITING, email: "GitHub authorize..." });
+            await handleGitHubAuthorize(activePage, log);
+
+            // Re-resolve page after authorize redirect
+            try {
+                const pages = await browser.pages();
+                const cb = [...pages].reverse().find((p) => {
+                    try {
+                        return p.url().includes("codebuddy.ai");
+                    } catch (_) {
+                        return false;
+                    }
+                });
+                if (cb) activePage = cb;
+                else if (pages.length) activePage = pages[pages.length - 1];
+            } catch (_) {}
+        }
 
         // 5) Region selection /started
         updateProgress({ step: STEPS.WAITING, email: "Region / started..." });
@@ -1048,6 +1201,7 @@ async function runCodebuddyWorker(
     progress,
     log,
     useProxy = true,
+    authMode = "github",
 ) {
     const CodebuddyWorker = require("./CodebuddyWorker");
     const worker = new CodebuddyWorker(
@@ -1059,20 +1213,34 @@ async function runCodebuddyWorker(
         progress,
         log,
         useProxy,
+        authMode,
     );
     return await worker.run();
 }
 
-async function runCodebuddyAutomation(sharedProgress = null, useProxy = true) {
+async function runCodebuddyAutomation(sharedProgress = null, useProxy = true, options = {}) {
     const config = getConfig();
     const logger = createFileLogger();
-    const accounts = readCodebuddyAccounts();
+    const authMode = (options && options.authMode) || "github";
+    
+    let accounts;
+    if (authMode === "google") {
+        const { readAccounts } = require("../../utils");
+        accounts = readAccounts();
+    } else {
+        accounts = readCodebuddyAccounts();
+    }
 
     if (accounts.length === 0) {
         if (!sharedProgress) {
-            console.log("No GitHub accounts found.");
-            console.log("Format (github_keys.txt): email:password:username");
-            console.log("Or accounts.txt: email|password|username");
+            if (authMode === "google") {
+                console.log("No Google accounts found in accounts.txt.");
+                console.log("Format (accounts.txt): email|password");
+            } else {
+                console.log("No GitHub accounts found.");
+                console.log("Format (github_keys.txt): email:password:username");
+                console.log("Or accounts.txt: email|password|username");
+            }
         }
         logger.close();
         return null;
@@ -1080,7 +1248,7 @@ async function runCodebuddyAutomation(sharedProgress = null, useProxy = true) {
 
     if (!sharedProgress) {
         console.log("");
-        console.log("Codebuddy Automation (GitHub OAuth)");
+        console.log(`Codebuddy Automation (${authMode.toUpperCase()} OAuth)`);
         console.log(`   Accounts: ${accounts.length}`);
         console.log("   Residential proxy recommended.");
         console.log("");
@@ -1092,7 +1260,7 @@ async function runCodebuddyAutomation(sharedProgress = null, useProxy = true) {
     const progress =
         sharedProgress ||
         createProgressManager(
-            `Codebuddy Automation — ${accounts.length} accounts, ${chunks.length} workers`,
+            `Codebuddy Automation (${authMode}) — ${accounts.length} accounts, ${chunks.length} workers`,
         );
 
     chunks.forEach((chunk, i) => {
@@ -1112,6 +1280,7 @@ async function runCodebuddyAutomation(sharedProgress = null, useProxy = true) {
                 progress,
                 logger.log,
                 useProxy,
+                authMode,
             );
         }),
     );
