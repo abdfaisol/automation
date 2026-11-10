@@ -241,12 +241,16 @@ function createFileLogger() {
     const logFile = path.join(logDir, `${timestamp}.log`);
     const stream = fs.createWriteStream(logFile, { flags: "a" });
 
+    let closed = false;
+
     function log(message) {
+        if (closed) return;
         const ts = new Date().toISOString();
         stream.write(`[${ts}] ${message}\n`);
     }
 
     function close() {
+        closed = true;
         stream.end();
     }
 
